@@ -1,56 +1,55 @@
 """
 Data collection script for COMP8420 NLP assignment.
-Fetches 200 human (Wikipedia) summaries and 200 machine (OpenAI) summaries,
-then saves to dataset.csv with columns: text, label, topic.
+Fetches 200 human (Wikipedia) summaries and 200 machine (OpenAI) summaries
+based on the same Wikipedia titles, then saves to dataset.csv with columns:
+text, label, topic.
 """
 
-import os
+import argparse
 import csv
+import os
+import random
 import time
+import warnings
+from typing import Optional
+
+from bs4 import GuessedAtParserWarning
 from dotenv import load_dotenv
+import httpx
 import wikipedia
 from openai import OpenAI
+
+warnings.filterwarnings("ignore", category=GuessedAtParserWarning)
 
 # Load environment variables
 load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY or OPENAI_API_KEY == "your_openai_api_key_here":
+if not OPENAI_API_KEY or OPENAI_API_KEY.strip() in {"", "your_openai_api_key_here"}:
     raise ValueError(
         "Please set OPENAI_API_KEY in your .env file. "
         "Get a key from https://platform.openai.com/api-keys"
     )
 
-NUM_SUMMARIES = 200
-OUTPUT_FILE = "dataset.csv"
+
+def _wikipedia_random_titles(pages: int) -> list[str]:
+    """
+    Return `pages` random Wikipedia titles.
+    The wikipedia package supports either wikipedia.random(pages=n) or wikipedia.random(n) depending on version.
+    """
+    try:
+        batch = wikipedia.random(pages=pages)
+    except TypeError:
+        batch = wikipedia.random(pages)
+
+    if isinstance(batch, str):
+        return [batch]
+    return list(batch)
 
 
-def get_wikipedia_titles(count: int) -> list[str]:
-    """Fetch a list of Wikipedia page titles (with retries for enough valid ones)."""
-    titles = []
-    seen = set()
-    batch_size = 20
-    while len(titles) < count:
-        try:
-            # wikipedia.random(pages=n) returns a list of n titles (or single string for n=1)
-            batch = wikipedia.random(pages=min(batch_size, count - len(titles) + 5))
-            if isinstance(batch, str):
-                batch = [batch]
-            for t in batch:
-                if t and t.strip() and t not in seen:
-                    seen.add(t)
-                    titles.append(t)
-                    if len(titles) >= count:
-                        return titles
-        except Exception:
-            pass
-    return titles[:count]
-
-
-def fetch_human_summary(title: str) -> str | None:
+def fetch_human_summary(title: str) -> Optional[str]:
     """Fetch Wikipedia summary for a title. Returns None on failure."""
     try:
-        wikipedia.set_lang("en")
         summary = wikipedia.summary(title, auto_suggest=False, redirect=True)
         return summary.strip() if summary else None
     except (
@@ -61,107 +60,127 @@ def fetch_human_summary(title: str) -> str | None:
         return None
 
 
-def fetch_machine_summary(client: OpenAI, title: str) -> str | None:
-    """Generate a Wikipedia-style summary using OpenAI for the given topic."""
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a helpful assistant that writes concise, "
-                        "encyclopedic Wikipedia-style summaries. Write only the summary, "
-                        "no preamble or meta-commentary."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": f"Write a brief Wikipedia-style summary for the topic: {title}",
-                },
-            ],
-            max_tokens=500,
-        )
-        text = response.choices[0].message.content
-        return text.strip() if text else None
-    except Exception:
-        return None
+def fetch_machine_summary(
+    client: OpenAI,
+    title: str,
+    model: str,
+    max_tokens: int,
+    max_retries: int,
+    base_sleep_s: float,
+) -> Optional[str]:
+    """Generate a Wikipedia-style summary using OpenAI for the given topic (with retries)."""
+    last_err: Optional[Exception] = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Write a concise, encyclopedic Wikipedia-style summary. "
+                            "Return only the summary text (no headings, no preamble, no meta commentary)."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Write a brief Wikipedia-style summary for the topic: {title}",
+                    },
+                ],
+                max_tokens=max_tokens,
+            )
+            text = response.choices[0].message.content if response.choices else None
+            text = text.strip() if text else None
+            if text:
+                return text
+        except Exception as e:
+            last_err = e
+            # Jittered exponential backoff for transient failures (rate limits, timeouts, 5xx)
+            sleep_s = base_sleep_s * (2 ** (attempt - 1))
+            sleep_s = min(sleep_s, 30.0) + random.random()
+            time.sleep(sleep_s)
+
+    if last_err:
+        raise last_err
+    return None
 
 
-def main():
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--n", type=int, default=200, help="Number of topics/summaries per class (default: 200)")
+    parser.add_argument("--output", type=str, default="dataset.csv", help="Output CSV path (default: dataset.csv)")
+    parser.add_argument("--model", type=str, default="gpt-4o-mini", help="OpenAI model for machine summaries")
+    parser.add_argument("--max-tokens", type=int, default=500, help="Max tokens for generated summary")
+    parser.add_argument("--wiki-batch", type=int, default=25, help="How many random Wikipedia titles to sample per batch")
+    parser.add_argument("--sleep", type=float, default=0.2, help="Base sleep between requests (seconds)")
+    parser.add_argument("--openai-timeout", type=float, default=60.0, help="OpenAI request timeout (seconds)")
+    parser.add_argument("--openai-retries", type=int, default=5, help="Retries per topic for OpenAI generation")
+    args = parser.parse_args()
+
+    wikipedia.set_lang("en")
+
     print("Loading OpenAI client...")
-    client = OpenAI(api_key=OPENAI_API_KEY)
+    timeout = httpx.Timeout(args.openai_timeout)
+    client = OpenAI(api_key=OPENAI_API_KEY, timeout=timeout)
 
-    print(f"Fetching {NUM_SUMMARIES} Wikipedia titles...")
-    titles = get_wikipedia_titles(NUM_SUMMARIES)
-    print(f"Got {len(titles)} titles.")
+    n = args.n
+    output_path = args.output
 
-    rows = []
-    human_done = 0
-    machine_done = 0
+    # Step 1: collect N valid Wikipedia summaries (human) and topics
+    print(f"Collecting {n} human Wikipedia summaries...")
+    human: list[dict] = []
+    seen_topics: set[str] = set()
+    attempts = 0
+    max_attempts = n * 50
+    while len(human) < n:
+        attempts += 1
+        if attempts > max_attempts:
+            raise RuntimeError(f"Could not collect {n} valid Wikipedia summaries after {max_attempts} attempts.")
 
-    for i, topic in enumerate(titles):
-        if (i + 1) % 20 == 0:
-            print(f"Progress: {i + 1}/{len(titles)} titles processed...")
-
-        # Human (Wikipedia) summary - Label 0
-        human_text = fetch_human_summary(topic)
-        if human_text:
-            rows.append({"text": human_text, "label": 0, "topic": topic})
-            human_done += 1
-
-        # Machine (OpenAI) summary - Label 1
-        machine_text = fetch_machine_summary(client, topic)
-        if machine_text:
-            rows.append({"text": machine_text, "label": 1, "topic": topic})
-            machine_done += 1
-
-        # Small delay to avoid rate limits
-        time.sleep(0.3)
-
-    # If we didn't get exactly 200 of each, report and keep going (or retry).
-    # Requirement: 200 human + 200 machine. We'll collect until we have 200 of each.
-    needed_human = NUM_SUMMARIES - human_done
-    needed_machine = NUM_SUMMARIES - machine_done
-
-    if needed_human > 0 or needed_machine > 0:
-        print(
-            f"First pass: {human_done} human, {machine_done} machine. "
-            f"Fetching more titles to reach 200 each..."
-        )
-        extra_titles = get_wikipedia_titles(needed_human + needed_machine + 50)
-        seen_topics = {r["topic"] for r in rows}
-        for topic in extra_titles:
+        batch = _wikipedia_random_titles(args.wiki_batch)
+        for topic in batch:
             if topic in seen_topics:
                 continue
-            if human_done < NUM_SUMMARIES:
-                human_text = fetch_human_summary(topic)
-                if human_text:
-                    rows.append({"text": human_text, "label": 0, "topic": topic})
-                    human_done += 1
-                    seen_topics.add(topic)
-            if machine_done < NUM_SUMMARIES:
-                machine_text = fetch_machine_summary(client, topic)
-                if machine_text:
-                    rows.append({"text": machine_text, "label": 1, "topic": topic})
-                    machine_done += 1
-                    seen_topics.add(topic)
-            time.sleep(0.3)
-            if human_done >= NUM_SUMMARIES and machine_done >= NUM_SUMMARIES:
+            seen_topics.add(topic)
+            human_text = fetch_human_summary(topic)
+            if human_text:
+                human.append({"text": human_text, "label": 0, "topic": topic})
+                if len(human) % 20 == 0:
+                    print(f"Human progress: {len(human)}/{n}")
+            time.sleep(args.sleep)
+            if len(human) >= n:
                 break
 
-    # Keep only 200 human and 200 machine for a clean dataset
-    human_rows = [r for r in rows if r["label"] == 0][:NUM_SUMMARIES]
-    machine_rows = [r for r in rows if r["label"] == 1][:NUM_SUMMARIES]
-    final_rows = human_rows + machine_rows
+    topics = [r["topic"] for r in human]
 
-    print(f"Writing {len(final_rows)} rows ({len(human_rows)} human, {len(machine_rows)} machine) to {OUTPUT_FILE}...")
-    with open(OUTPUT_FILE, "w", newline="", encoding="utf-8") as f:
+    # Step 2: generate machine summaries for the same topics
+    print(f"Generating {n} machine summaries for the same topics...")
+    machine: list[dict] = []
+    for idx, topic in enumerate(topics, start=1):
+        machine_text = fetch_machine_summary(
+            client=client,
+            title=topic,
+            model=args.model,
+            max_tokens=args.max_tokens,
+            max_retries=args.openai_retries,
+            base_sleep_s=max(args.sleep, 0.2),
+        )
+        if not machine_text:
+            raise RuntimeError(f"OpenAI returned empty content for topic: {topic!r}")
+        machine.append({"text": machine_text, "label": 1, "topic": topic})
+        if idx % 20 == 0:
+            print(f"Machine progress: {idx}/{n}")
+        time.sleep(args.sleep)
+
+    final_rows = human + machine
+
+    print(f"Writing {len(final_rows)} rows to {output_path}...")
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["text", "label", "topic"])
         writer.writeheader()
         writer.writerows(final_rows)
 
-    print(f"Done. Saved to {OUTPUT_FILE}.")
+    print(f"Done. Saved to {output_path}.")
 
 
 if __name__ == "__main__":
