@@ -1,0 +1,2 @@
+- created a script for creating database.
+- removed other languages data
